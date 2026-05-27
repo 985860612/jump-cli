@@ -6,8 +6,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
@@ -96,6 +99,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selected = &it
 				}
 				return m, tea.Quit
+			case "d":
+				// 把当前 host 从 MRU 历史里抹掉（不删 host，只复位它的最近使用时间）
+				if it, ok := m.list.SelectedItem().(hostEntry); ok {
+					deleteHistoryForName(it.name)
+					return m, m.list.NewStatusMessage("removed from MRU: " + it.name)
+				}
 			}
 		} else if msg.String() == "enter" {
 			// 过滤中按 enter：先 accept filter 再让用户再按 enter 选中
@@ -122,6 +131,19 @@ func main() {
 		configPath = p
 	}
 
+	// 模式开关：--list / --completion 走完即退，不进 TUI
+	for _, a := range os.Args[1:] {
+		switch a {
+		case "--list":
+			runList(configPath)
+			return
+		case "--completion":
+			// 默认输出 zsh 脚本（目前只支持 zsh）
+			runCompletion()
+			return
+		}
+	}
+
 	hosts, err := parseSSHConfig(configPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "parse ssh config:", err)
@@ -130,6 +152,40 @@ func main() {
 	if len(hosts) == 0 {
 		fmt.Fprintln(os.Stderr, "no Host entries found in", configPath)
 		os.Exit(1)
+	}
+
+	// CLI 透传 & 预填过滤：第一个非 flag 的位置参数作为初始过滤词，剩余原样给 ssh
+	var initialFilter string
+	sshExtraArgs := os.Args[1:]
+	if len(sshExtraArgs) > 0 && !strings.HasPrefix(sshExtraArgs[0], "-") {
+		initialFilter = sshExtraArgs[0]
+		sshExtraArgs = sshExtraArgs[1:]
+	}
+
+	// MRU：按上次选中时间倒序排（没用过的按 ssh config 原序在后）
+	hist := loadHistory()
+	sort.SliceStable(hosts, func(i, j int) bool {
+		return hist[hosts[i].name] > hist[hosts[j].name]
+	})
+
+	// 命中预填：先按名字精确匹配（不区分大小写），命中唯一就跳过 TUI 直接连
+	if initialFilter != "" {
+		if h := findExactName(hosts, initialFilter); h != nil {
+			execSSH(*h, sshExtraArgs)
+			return
+		}
+		needle := strings.ToLower(initialFilter)
+		narrowed := hosts[:0]
+		for _, h := range hosts {
+			if strings.Contains(strings.ToLower(h.FilterValue()), needle) {
+				narrowed = append(narrowed, h)
+			}
+		}
+		if len(narrowed) == 0 {
+			fmt.Fprintln(os.Stderr, "no host matches", initialFilter)
+			os.Exit(1)
+		}
+		hosts = narrowed
 	}
 
 	items := make([]list.Item, 0, len(hosts))
@@ -159,32 +215,242 @@ func main() {
 		os.Exit(130) // 取消
 	}
 
+	execSSH(*final.selected, sshExtraArgs)
+}
+
+// execSSH 记录历史 + 拼远端命令 + syscall.Exec 替换成 ssh。正常情况下不返回。
+func execSSH(h hostEntry, extraArgs []string) {
+	recordHistory(h.name)
+
 	sshBin, err := exec.LookPath("ssh")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "ssh not found in PATH")
 		os.Exit(1)
 	}
 	args := []string{"ssh"}
-	args = append(args, os.Args[1:]...) // 透传给 ssh 的额外选项
+	args = append(args, extraArgs...)
+
 	switch {
-	case final.selected.cmd != "":
+	case h.cmd != "":
 		// 远端跑指定命令；如同时配了 cwd 就先 cd。完事 ssh 退出，本进程一起退。
-		remote := final.selected.cmd
-		if final.selected.cwd != "" {
-			remote = "cd " + shellQuote(final.selected.cwd) + " && " + final.selected.cmd
+		remote := h.cmd
+		if h.cwd != "" {
+			remote = "cd " + shellQuote(h.cwd) + " && " + h.cmd
 		}
-		args = append(args, "-t", final.selected.name, remote)
-	case final.selected.cwd != "":
-		// 远端命令：cd 到预设目录，再起一个登录 shell 接管
-		args = append(args, "-t", final.selected.name,
-			"cd "+shellQuote(final.selected.cwd)+" && exec ${SHELL:-/bin/sh} -l")
+		args = append(args, "-t", h.name, remote)
+	case h.cwd != "":
+		args = append(args, "-t", h.name,
+			"cd "+shellQuote(h.cwd)+" && exec ${SHELL:-/bin/sh} -l")
 	default:
-		args = append(args, final.selected.name)
+		args = append(args, h.name)
 	}
 	if err := syscall.Exec(sshBin, args, os.Environ()); err != nil {
 		fmt.Fprintln(os.Stderr, "exec ssh:", err)
 		os.Exit(1)
 	}
+}
+
+// runList 打印 "name\tdesc" 一行一个 host，供 shell 补全脚本读取
+func runList(configPath string) {
+	hosts, err := parseSSHConfig(configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "parse ssh config:", err)
+		os.Exit(1)
+	}
+	// 用 MRU 排序，补全候选顺序也跟 TUI 一致
+	hist := loadHistory()
+	sort.SliceStable(hosts, func(i, j int) bool {
+		return hist[hosts[i].name] > hist[hosts[j].name]
+	})
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+	for _, h := range hosts {
+		desc := h.comment
+		if h.tag != "" {
+			if desc == "" {
+				desc = "[" + h.tag + "]"
+			} else {
+				desc = "[" + h.tag + "] " + desc
+			}
+		}
+		// 描述里不能带 \n / \t（会破坏 _describe 解析）
+		desc = strings.ReplaceAll(desc, "\t", " ")
+		desc = strings.ReplaceAll(desc, "\n", " ")
+		fmt.Fprintf(w, "%s\t%s\n", h.name, desc)
+	}
+}
+
+// runCompletion 输出 zsh 补全脚本到 stdout。用户：source <(jump --completion)
+func runCompletion() {
+	fmt.Print(`#compdef jump j
+
+_jump() {
+    local -a hosts
+    local name desc
+    while IFS=$'\t' read -r name desc; do
+        if [[ -n "$desc" ]]; then
+            hosts+=("${name}:${desc}")
+        else
+            hosts+=("${name}")
+        fi
+    done < <(jump --list 2>/dev/null)
+    _describe -t hosts 'ssh host' hosts
+}
+
+compdef _jump jump j
+`)
+}
+
+func findExactName(hosts []hostEntry, name string) *hostEntry {
+	target := strings.ToLower(name)
+	for i := range hosts {
+		if strings.ToLower(hosts[i].name) == target {
+			return &hosts[i]
+		}
+	}
+	return nil
+}
+
+// ---------------- MRU history ----------------
+
+func historyPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "state", "jump", "history")
+}
+
+// loadHistory 读历史文件，每行 "<unix_ts>\t<name>"，返回 name → 最近一次时间戳
+func loadHistory() map[string]int64 {
+	f, err := os.Open(historyPath())
+	if err != nil {
+		return map[string]int64{}
+	}
+	defer f.Close()
+	result := map[string]int64{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		i := strings.IndexByte(line, '\t')
+		if i <= 0 || i+1 >= len(line) {
+			continue
+		}
+		ts, err := strconv.ParseInt(line[:i], 10, 64)
+		if err != nil {
+			continue
+		}
+		name := line[i+1:]
+		if ts > result[name] {
+			result[name] = ts
+		}
+	}
+	return result
+}
+
+// recordHistory 追加一行到历史文件；失败静默（不能阻断 ssh）。
+// 顺手在文件超过阈值时压缩一次。
+func recordHistory(name string) {
+	p := historyPath()
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(f, "%d\t%s\n", time.Now().Unix(), name)
+	if info, err := f.Stat(); err == nil && info.Size() > 100<<10 {
+		f.Close()
+		pruneHistory()
+		return
+	}
+	f.Close()
+}
+
+// deleteHistoryForName 从历史文件里删掉所有 host name 匹配的行
+func deleteHistoryForName(name string) {
+	p := historyPath()
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return
+	}
+	suffix := "\t" + name
+	var b strings.Builder
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" || strings.HasSuffix(line, suffix) {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	writeAtomic(p, b.String())
+}
+
+// pruneHistory 压缩历史文件：保留 (每个 host 最新一行) ∪ (全局最近 200 行)
+func pruneHistory() {
+	p := historyPath()
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return
+	}
+	type entry struct {
+		ts   int64
+		line string
+		name string
+	}
+	var entries []entry
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		i := strings.IndexByte(line, '\t')
+		if i <= 0 || i+1 >= len(line) {
+			continue
+		}
+		ts, err := strconv.ParseInt(line[:i], 10, 64)
+		if err != nil {
+			continue
+		}
+		entries = append(entries, entry{ts, line, line[i+1:]})
+	}
+	// 按 ts 降序排，方便挑 top 200 和每个 name 的最新
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ts > entries[j].ts })
+	keep := make([]bool, len(entries))
+	seenName := map[string]bool{}
+	for i, e := range entries {
+		if i < 200 {
+			keep[i] = true
+		}
+		if !seenName[e.name] {
+			keep[i] = true
+			seenName[e.name] = true
+		}
+	}
+	// 写回时再按 ts 升序排，文件保持时间顺序
+	type idxEntry struct {
+		i int
+		e entry
+	}
+	var kept []idxEntry
+	for i, e := range entries {
+		if keep[i] {
+			kept = append(kept, idxEntry{i, e})
+		}
+	}
+	sort.Slice(kept, func(i, j int) bool { return kept[i].e.ts < kept[j].e.ts })
+	var b strings.Builder
+	for _, k := range kept {
+		b.WriteString(k.e.line)
+		b.WriteByte('\n')
+	}
+	writeAtomic(p, b.String())
+}
+
+// writeAtomic 写临时文件再 rename，避免崩在中途留半截文件
+func writeAtomic(path, content string) {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
 }
 
 func shellQuote(s string) string {
