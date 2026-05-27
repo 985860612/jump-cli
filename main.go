@@ -18,40 +18,61 @@ import (
 var version = "dev"
 
 type hostEntry struct {
-	name     string
-	hostName string
-	user     string
-	comment  string
-	cwd      string // 预设远端工作目录，来自注释里的 cwd=xxx 或 cwd:xxx
+	name      string
+	hostName  string
+	user      string
+	port      string // ssh config 的 Port，非 22 时显示
+	proxyJump string // ssh config 的 ProxyJump，跳板链
+	comment   string
+	cwd       string // 预设远端工作目录，来自注释里的 cwd=xxx 或 cwd:xxx
+	tag       string // 分组标签，来自注释里的 tag=xxx 或 tag:xxx
+	cmd       string // 远端命令，来自注释里 cmd=（贪婪，取到行尾）
 }
 
 func (h hostEntry) Title() string {
-	if h.comment != "" {
-		return h.name + "  ·  " + h.comment
+	head := h.name
+	if h.tag != "" {
+		head = "[" + h.tag + "] " + head
 	}
-	return h.name
+	if h.comment != "" {
+		return head + "  ·  " + h.comment
+	}
+	return head
 }
 
 func (h hostEntry) Description() string {
+	hp := h.hostName
+	if h.port != "" && h.port != "22" {
+		if hp == "" {
+			hp = "?"
+		}
+		hp += ":" + h.port
+	}
 	var base string
 	switch {
-	case h.user != "" && h.hostName != "":
-		base = h.user + "@" + h.hostName
-	case h.hostName != "":
-		base = h.hostName
+	case h.user != "" && hp != "":
+		base = h.user + "@" + hp
+	case hp != "":
+		base = hp
 	case h.user != "":
 		base = h.user + "@?"
 	default:
 		base = "(no HostName)"
 	}
+	if h.proxyJump != "" {
+		base += "  via " + h.proxyJump
+	}
 	if h.cwd != "" {
 		base += "  cwd=" + h.cwd
+	}
+	if h.cmd != "" {
+		base += "  cmd=" + h.cmd
 	}
 	return base
 }
 
 func (h hostEntry) FilterValue() string {
-	return h.name + " " + h.hostName + " " + h.user + " " + h.comment
+	return h.name + " " + h.hostName + " " + h.user + " " + h.comment + " " + h.tag
 }
 
 type model struct {
@@ -145,11 +166,19 @@ func main() {
 	}
 	args := []string{"ssh"}
 	args = append(args, os.Args[1:]...) // 透传给 ssh 的额外选项
-	if final.selected.cwd != "" {
+	switch {
+	case final.selected.cmd != "":
+		// 远端跑指定命令；如同时配了 cwd 就先 cd。完事 ssh 退出，本进程一起退。
+		remote := final.selected.cmd
+		if final.selected.cwd != "" {
+			remote = "cd " + shellQuote(final.selected.cwd) + " && " + final.selected.cmd
+		}
+		args = append(args, "-t", final.selected.name, remote)
+	case final.selected.cwd != "":
 		// 远端命令：cd 到预设目录，再起一个登录 shell 接管
 		args = append(args, "-t", final.selected.name,
 			"cd "+shellQuote(final.selected.cwd)+" && exec ${SHELL:-/bin/sh} -l")
-	} else {
+	default:
 		args = append(args, final.selected.name)
 	}
 	if err := syscall.Exec(sshBin, args, os.Environ()); err != nil {
@@ -160,6 +189,15 @@ func main() {
 
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func firstNonEmpty(ss ...string) string {
+	for _, s := range ss {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // ---------------- ssh config parser ----------------
@@ -203,11 +241,15 @@ func parseFile(path string, seen map[string]bool) ([]hostEntry, error) {
 	defer f.Close()
 
 	type bucket struct {
-		names    []string
-		hostName string
-		user     string
-		comment  string
-		cwd      string
+		names     []string
+		hostName  string
+		user      string
+		port      string
+		proxyJump string
+		comment   string
+		cwd       string
+		tag       string
+		cmd       string
 	}
 	var out []hostEntry
 	var current *bucket
@@ -220,11 +262,15 @@ func parseFile(path string, seen map[string]bool) ([]hostEntry, error) {
 				continue
 			}
 			out = append(out, hostEntry{
-				name:     n,
-				hostName: current.hostName,
-				user:     current.user,
-				comment:  current.comment,
-				cwd:      current.cwd,
+				name:      n,
+				hostName:  current.hostName,
+				user:      current.user,
+				port:      current.port,
+				proxyJump: current.proxyJump,
+				comment:   current.comment,
+				cwd:       current.cwd,
+				tag:       current.tag,
+				cmd:       current.cmd,
 			})
 		}
 		current = nil
@@ -257,17 +303,19 @@ func parseFile(path string, seen map[string]bool) ([]hostEntry, error) {
 		switch strings.ToLower(key) {
 		case "host":
 			flush()
-			cleanedPending, cwdFromPending := extractCwdFromMany(pendingComments)
-			cleanedTrail, cwdFromTrail := extractCwdFromOne(trailComment)
-			cwd := cwdFromPending
-			if cwd == "" {
-				cwd = cwdFromTrail
-			}
+			cleanedPending, cwdP, tagP, cmdP := extractTokensFromMany(pendingComments)
+			cleanedTrail, cwdT, tagT, cmdT := extractTokens(trailComment)
 			current = &bucket{
 				names:   strings.Fields(val),
 				comment: joinComments(cleanedPending, cleanedTrail),
-				cwd:     cwd,
+				cwd:     firstNonEmpty(cwdP, cwdT),
+				tag:     firstNonEmpty(tagP, tagT),
+				cmd:     firstNonEmpty(cmdP, cmdT),
 			}
+		case "match":
+			// Match 块跟 Host 不是同一种东西：里面的 HostName/User 不应该回流到上一个 Host bucket。
+			// 直接 flush 上一个 bucket，让后续字段无处可去（current == nil 时 hostname/user 分支都是 no-op）。
+			flush()
 		case "hostname":
 			if current != nil {
 				current.hostName = val
@@ -275,6 +323,14 @@ func parseFile(path string, seen map[string]bool) ([]hostEntry, error) {
 		case "user":
 			if current != nil {
 				current.user = val
+			}
+		case "port":
+			if current != nil {
+				current.port = val
+			}
+		case "proxyjump":
+			if current != nil {
+				current.proxyJump = val
 			}
 		case "include":
 			flush()
@@ -319,11 +375,17 @@ func findCommentStart(s string) int {
 	return -1
 }
 
-// extractCwdFromOne 在一段注释里找形如 `cwd=/path` 或 `cwd:/path` 的 token，
-// 返回剥掉该 token 后的文本和 cwd 值。找不到 cwd 返回 "".
-func extractCwdFromOne(text string) (rest, cwd string) {
+// extractTokens 从一段注释里抽出 cwd=/cwd: tag=/tag: cmd= 三种 token。
+// cmd= 是贪婪的：取到行尾全部内容作为远端命令；其他 token 不再被识别。
+// 返回剥掉 token 后的剩余文本以及抽到的值。
+func extractTokens(text string) (rest, cwd, tag, cmd string) {
 	if text == "" {
-		return "", ""
+		return "", "", "", ""
+	}
+	// 先处理 cmd=：必须在 word 边界，整段取到行尾
+	if idx := findTokenStart(text, "cmd="); idx >= 0 {
+		cmd = strings.TrimSpace(text[idx+len("cmd="):])
+		text = strings.TrimSpace(text[:idx])
 	}
 	tokens := strings.Fields(text)
 	keep := tokens[:0]
@@ -338,22 +400,54 @@ func extractCwdFromOne(text string) (rest, cwd string) {
 				continue
 			}
 		}
+		if tag == "" {
+			if v, ok := strings.CutPrefix(t, "tag="); ok {
+				tag = v
+				continue
+			}
+			if v, ok := strings.CutPrefix(t, "tag:"); ok {
+				tag = v
+				continue
+			}
+		}
 		keep = append(keep, t)
 	}
-	return strings.Join(keep, " "), cwd
+	return strings.Join(keep, " "), cwd, tag, cmd
 }
 
-func extractCwdFromMany(comments []string) (cleaned []string, cwd string) {
+func extractTokensFromMany(comments []string) (cleaned []string, cwd, tag, cmd string) {
 	for _, c := range comments {
-		rest, v := extractCwdFromOne(c)
-		if cwd == "" && v != "" {
-			cwd = v
+		rest, vCwd, vTag, vCmd := extractTokens(c)
+		if cwd == "" {
+			cwd = vCwd
+		}
+		if tag == "" {
+			tag = vTag
+		}
+		if cmd == "" {
+			cmd = vCmd
 		}
 		if rest != "" {
 			cleaned = append(cleaned, rest)
 		}
 	}
-	return cleaned, cwd
+	return cleaned, cwd, tag, cmd
+}
+
+// findTokenStart 找到 prefix 在 s 中第一个处于 word 边界的位置（前面是 BOS 或空白），找不到返回 -1
+func findTokenStart(s, prefix string) int {
+	for from := 0; from < len(s); {
+		i := strings.Index(s[from:], prefix)
+		if i < 0 {
+			return -1
+		}
+		abs := from + i
+		if abs == 0 || s[abs-1] == ' ' || s[abs-1] == '\t' {
+			return abs
+		}
+		from = abs + 1
+	}
+	return -1
 }
 
 func joinComments(pending []string, trailing string) string {
