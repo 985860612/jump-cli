@@ -1,8 +1,1 @@
-# 本地编译产物（实际部署到 ~/bin/jump，仓库内不应残留）
-/jump
-/j
-
-# IDE
-.idea/
-.vscode/
-.DS_Store
+dist/

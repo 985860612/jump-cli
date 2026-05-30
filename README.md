@@ -7,6 +7,27 @@
 
 ## 安装
 
+### 下载预编译二进制（推荐）
+
+前往 [Releases](https://github.com/985860612/jump-cli/releases) 下载对应平台的文件：
+
+| 平台 | 架构 | 文件 |
+|------|------|------|
+| macOS | Intel | `jump-*-darwin-amd64` |
+| macOS | Apple Silicon | `jump-*-darwin-arm64` |
+| Linux | x86_64 | `jump-*-linux-amd64` |
+| Linux | ARM64 | `jump-*-linux-arm64` |
+| Windows | x86_64 | `jump-*-windows-amd64.exe` |
+
+```bash
+# macOS / Linux
+chmod +x jump-v0.1.0-darwin-arm64
+sudo mv jump-v0.1.0-darwin-arm64 /usr/local/bin/jump
+ln -s /usr/local/bin/jump /usr/local/bin/j  # 可选：短命令
+```
+
+### 从源码构建
+
 ```bash
 git clone https://github.com/985860612/jump-cli.git
 cd jump-cli
