@@ -14,6 +14,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// version is set via -ldflags at build time.
+var version = "dev"
+
 type hostEntry struct {
 	name     string
 	hostName string
@@ -86,6 +89,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() string { return m.list.View() }
 
 func main() {
+	for _, arg := range os.Args[1:] {
+		if arg == "-v" || arg == "--version" || arg == "version" {
+			fmt.Println("jump", version)
+			return
+		}
+	}
+
 	configPath := filepath.Join(os.Getenv("HOME"), ".ssh", "config")
 	if p := os.Getenv("SSH_CONFIG"); p != "" {
 		configPath = p
