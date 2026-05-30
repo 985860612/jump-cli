@@ -1,5 +1,7 @@
 # jump-cli
 
+**[English](README.en.md)** | 中文
+
 终端 SSH host 选择器。读 `~/.ssh/config`，用 [bubbletea](https://github.com/charmbracelet/bubbletea) 跑一个模糊搜索 TUI，回车后直接 `exec ssh <host>`。
 
 ![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)
