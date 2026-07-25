@@ -30,6 +30,7 @@ type hostEntry struct {
 	cwd       string // 预设远端工作目录，来自注释里的 cwd=xxx 或 cwd:xxx
 	tag       string // 分组标签，来自注释里的 tag=xxx 或 tag:xxx
 	cmd       string // 远端命令，来自注释里 cmd=（贪婪，取到行尾）
+	svc       string // 部署的服务清单，来自注释里 svc=xxx 或 svc:xxx（逗号分隔多个）
 }
 
 func (h hostEntry) Title() string {
@@ -65,6 +66,9 @@ func (h hostEntry) Description() string {
 	if h.proxyJump != "" {
 		base += "  via " + h.proxyJump
 	}
+	if h.svc != "" {
+		base += "  ⚙ " + h.svc
+	}
 	if h.cwd != "" {
 		base += "  cwd=" + h.cwd
 	}
@@ -75,7 +79,7 @@ func (h hostEntry) Description() string {
 }
 
 func (h hostEntry) FilterValue() string {
-	return h.name + " " + h.hostName + " " + h.user + " " + h.comment + " " + h.tag
+	return h.name + " " + h.hostName + " " + h.user + " " + h.comment + " " + h.tag + " " + h.svc
 }
 
 type model struct {
@@ -266,6 +270,13 @@ func runList(configPath string) {
 	defer w.Flush()
 	for _, h := range hosts {
 		desc := h.comment
+		if h.svc != "" {
+			if desc == "" {
+				desc = "⚙ " + h.svc
+			} else {
+				desc += " · ⚙ " + h.svc
+			}
+		}
 		if h.tag != "" {
 			if desc == "" {
 				desc = "[" + h.tag + "]"
@@ -516,6 +527,7 @@ func parseFile(path string, seen map[string]bool) ([]hostEntry, error) {
 		cwd       string
 		tag       string
 		cmd       string
+		svc       string
 	}
 	var out []hostEntry
 	var current *bucket
@@ -537,6 +549,7 @@ func parseFile(path string, seen map[string]bool) ([]hostEntry, error) {
 				cwd:       current.cwd,
 				tag:       current.tag,
 				cmd:       current.cmd,
+				svc:       current.svc,
 			})
 		}
 		current = nil
@@ -569,14 +582,15 @@ func parseFile(path string, seen map[string]bool) ([]hostEntry, error) {
 		switch strings.ToLower(key) {
 		case "host":
 			flush()
-			cleanedPending, cwdP, tagP, cmdP := extractTokensFromMany(pendingComments)
-			cleanedTrail, cwdT, tagT, cmdT := extractTokens(trailComment)
+			cleanedPending, cwdP, tagP, cmdP, svcP := extractTokensFromMany(pendingComments)
+			cleanedTrail, cwdT, tagT, cmdT, svcT := extractTokens(trailComment)
 			current = &bucket{
 				names:   strings.Fields(val),
 				comment: joinComments(cleanedPending, cleanedTrail),
 				cwd:     firstNonEmpty(cwdP, cwdT),
 				tag:     firstNonEmpty(tagP, tagT),
 				cmd:     firstNonEmpty(cmdP, cmdT),
+				svc:     firstNonEmpty(svcP, svcT),
 			}
 		case "match":
 			// Match 块跟 Host 不是同一种东西：里面的 HostName/User 不应该回流到上一个 Host bucket。
@@ -641,12 +655,13 @@ func findCommentStart(s string) int {
 	return -1
 }
 
-// extractTokens 从一段注释里抽出 cwd=/cwd: tag=/tag: cmd= 三种 token。
+// extractTokens 从一段注释里抽出 cwd=/cwd: tag=/tag: svc=/svc: cmd= 四种 token。
 // cmd= 是贪婪的：取到行尾全部内容作为远端命令；其他 token 不再被识别。
+// svc=/svc: 是单 token（多个服务用逗号分隔，中间别留空格）。
 // 返回剥掉 token 后的剩余文本以及抽到的值。
-func extractTokens(text string) (rest, cwd, tag, cmd string) {
+func extractTokens(text string) (rest, cwd, tag, cmd, svc string) {
 	if text == "" {
-		return "", "", "", ""
+		return "", "", "", "", ""
 	}
 	// 先处理 cmd=：必须在 word 边界，整段取到行尾
 	if idx := findTokenStart(text, "cmd="); idx >= 0 {
@@ -676,14 +691,24 @@ func extractTokens(text string) (rest, cwd, tag, cmd string) {
 				continue
 			}
 		}
+		if svc == "" {
+			if v, ok := strings.CutPrefix(t, "svc="); ok {
+				svc = v
+				continue
+			}
+			if v, ok := strings.CutPrefix(t, "svc:"); ok {
+				svc = v
+				continue
+			}
+		}
 		keep = append(keep, t)
 	}
-	return strings.Join(keep, " "), cwd, tag, cmd
+	return strings.Join(keep, " "), cwd, tag, cmd, svc
 }
 
-func extractTokensFromMany(comments []string) (cleaned []string, cwd, tag, cmd string) {
+func extractTokensFromMany(comments []string) (cleaned []string, cwd, tag, cmd, svc string) {
 	for _, c := range comments {
-		rest, vCwd, vTag, vCmd := extractTokens(c)
+		rest, vCwd, vTag, vCmd, vSvc := extractTokens(c)
 		if cwd == "" {
 			cwd = vCwd
 		}
@@ -693,11 +718,14 @@ func extractTokensFromMany(comments []string) (cleaned []string, cwd, tag, cmd s
 		if cmd == "" {
 			cmd = vCmd
 		}
+		if svc == "" {
+			svc = vSvc
+		}
 		if rest != "" {
 			cleaned = append(cleaned, rest)
 		}
 	}
-	return cleaned, cwd, tag, cmd
+	return cleaned, cwd, tag, cmd, svc
 }
 
 // findTokenStart 找到 prefix 在 s 中第一个处于 word 边界的位置（前面是 BOS 或空白），找不到返回 -1

@@ -35,12 +35,13 @@
 | --- | --- | --- |
 | `cwd=` / `cwd:` | 单 token | 选中后 `ssh -t <host> 'cd <cwd> && exec ${SHELL:-/bin/sh} -l'` |
 | `tag=` / `tag:` | 单 token | 列表 title 前缀显示 `[tag]`，并参与 fuzzy 过滤 |
+| `svc=` / `svc:` | 单 token（多服务逗号分隔，别留空格） | 列表 description 里显示 `⚙ <svc>`，标注这台机器部署了什么服务；参与 fuzzy 过滤，`--list` 补全描述里也带上 |
 | `cmd=` | **贪婪到行尾**，必须放最后 | 选中后 `ssh -t <host> '<cmd>'`，跑完即退；若同时配 `cwd=` 会先 cd |
 
 例：
 
 ```sshconfig
-# cwd=/data/app tag=prod  阿里云北京 客户A
+# cwd=/data/app tag=prod svc=nginx,redis,pg  阿里云北京 客户A
 Host s1
     HostName 1.2.3.4
     User root
