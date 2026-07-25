@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -83,8 +84,12 @@ func (h hostEntry) FilterValue() string {
 }
 
 type model struct {
-	list     list.Model
-	selected *hostEntry
+	list       list.Model
+	settings   list.Model // 设置面板（配色方案选择器）
+	inSettings bool
+	theme      *theme // 当前生效的主题
+	origTheme  *theme // 打开设置前的主题，esc 回滚用
+	selected   *hostEntry
 }
 
 func (m model) Init() tea.Cmd { return nil }
@@ -93,7 +98,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.list.SetSize(msg.Width, msg.Height-2)
+		m.settings.SetSize(msg.Width, msg.Height-2)
 	case tea.KeyMsg:
+		if m.inSettings {
+			return m.updateSettings(msg)
+		}
 		if m.list.FilterState() != list.Filtering {
 			switch msg.String() {
 			case "q", "ctrl+c", "esc":
@@ -109,10 +118,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					deleteHistoryForName(it.name)
 					return m, m.list.NewStatusMessage("removed from MRU: " + it.name)
 				}
+			case "t":
+				m.origTheme = m.theme
+				// 光标定位到当前主题
+				for i, it := range m.settings.Items() {
+					if ti, ok := it.(themeItem); ok && ti.theme.name == m.theme.name {
+						m.settings.Select(i)
+						break
+					}
+				}
+				m.inSettings = true
+				return m, nil
 			}
-		} else if msg.String() == "enter" {
-			// 过滤中按 enter：先 accept filter 再让用户再按 enter 选中
-			// bubbles list 本身就是这个行为，无需特殊处理
 		}
 	}
 	var cmd tea.Cmd
@@ -120,7 +137,46 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m model) View() string { return m.list.View() }
+// updateSettings 设置面板按键：↑↓ 移动实时预览，enter 保存到配置文件，esc/q 取消回滚，ctrl+c 直接退出
+func (m model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		m.inSettings = false
+		if it, ok := m.settings.SelectedItem().(themeItem); ok {
+			m.theme = it.theme
+			applyThemeToList(&m.list, it.theme)
+			saveConfigTheme(it.theme.name)
+			return m, m.list.NewStatusMessage("theme saved: " + it.theme.name)
+		}
+		return m, nil
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc", "q":
+		applyThemeToList(&m.list, m.origTheme)
+		applyThemeToList(&m.settings, m.origTheme)
+		m.theme = m.origTheme
+		m.inSettings = false
+		return m, nil
+	}
+	prev := m.settings.Index()
+	var cmd tea.Cmd
+	m.settings, cmd = m.settings.Update(msg)
+	if m.settings.Index() != prev {
+		// 移动即预览：host 列表和设置面板都换上新主题
+		if it, ok := m.settings.SelectedItem().(themeItem); ok {
+			applyThemeToList(&m.list, it.theme)
+			applyThemeToList(&m.settings, it.theme)
+		}
+	}
+	return m, cmd
+}
+
+func (m model) View() string {
+	if m.inSettings {
+		return m.settings.View()
+	}
+	return m.list.View()
+}
 
 func main() {
 	for _, arg := range os.Args[1:] {
@@ -216,18 +272,27 @@ func main() {
 		hosts = narrowed
 	}
 
-	// 配色：放在直连路径之后才解析，j s1 直连不受 JUMP_THEME 笔误影响；
-	// 进 TUI 前校验，未知名字报错列出全部可选
+	// 配色：放在直连路径之后才解析，j s1 直连不受主题配置影响。
+	// 优先级：--theme 旗标 > JUMP_THEME > 配置文件 > default。
+	// 旗标/环境变量写错 → 报错退出；配置文件里的脏值 → 静默回退 default（不挡 TUI）
+	explicit := themeName != ""
+	if themeName == "" {
+		themeName = loadConfig()["theme"]
+	}
 	if themeName == "" {
 		themeName = "default"
 	}
 	th := findTheme(themeName)
 	if th == nil {
-		fmt.Fprintf(os.Stderr, "unknown theme %q, available:\n", themeName)
-		for _, t := range themeList {
-			fmt.Fprintf(os.Stderr, "  %s\t%s\n", t.name, t.desc)
+		if !explicit {
+			th = findTheme("default")
+		} else {
+			fmt.Fprintf(os.Stderr, "unknown theme %q, available:\n", themeName)
+			for _, t := range themeList {
+				fmt.Fprintf(os.Stderr, "  %s\t%s\n", t.name, t.desc)
+			}
+			os.Exit(1)
 		}
-		os.Exit(1)
 	}
 
 	items := make([]list.Item, 0, len(hosts))
@@ -235,22 +300,34 @@ func main() {
 		items = append(items, h)
 	}
 
-	delegate := list.NewDefaultDelegate()
-	applyTheme(&delegate, th)
-
-	l := list.New(items, delegate, 80, 20)
+	l := list.New(items, list.NewDefaultDelegate(), 80, 20)
 	l.Title = fmt.Sprintf("ssh hosts  (%d entries from %s)", len(hosts), prettyPath(configPath))
 	l.SetShowStatusBar(true)
 	l.SetFilteringEnabled(true)
-	l.Styles.Title = lipgloss.NewStyle().
-		Bold(true).
-		Foreground(th.titleFg).
-		Background(th.titleBg).
-		Padding(0, 1)
-	l.Styles.FilterPrompt = lipgloss.NewStyle().Foreground(th.accent)
-	l.Styles.FilterCursor = lipgloss.NewStyle().Foreground(th.accent)
+	l.AdditionalShortHelpKeys = func() []key.Binding {
+		return []key.Binding{key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "theme"))}
+	}
+	applyThemeToList(&l, th)
 
-	p := tea.NewProgram(model{list: l}, tea.WithAltScreen())
+	// 设置面板：配色方案选择器（t 键打开）
+	themeItems := make([]list.Item, 0, len(themeList))
+	start := 0
+	for i := range themeList {
+		themeItems = append(themeItems, themeItem{theme: &themeList[i]})
+		if themeList[i].name == th.name {
+			start = i
+		}
+	}
+	tl := list.New(themeItems, list.NewDefaultDelegate(), 80, 20)
+	tl.Title = "settings · theme  (enter 保存 · esc 取消)"
+	tl.SetShowStatusBar(false)
+	tl.SetFilteringEnabled(false)
+	tl.SetShowPagination(false)
+	tl.SetShowHelp(false)
+	tl.Select(start)
+	applyThemeToList(&tl, th)
+
+	p := tea.NewProgram(model{list: l, settings: tl, theme: th}, tea.WithAltScreen())
 	finalM, err := p.Run()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "tui:", err)
@@ -405,11 +482,30 @@ func findTheme(name string) *theme {
 	return nil
 }
 
-// applyTheme 只换颜色，保留默认 delegate 的 padding / 边框形状
-func applyTheme(d *list.DefaultDelegate, t *theme) {
+// themeItem 设置面板里的列表项
+type themeItem struct{ theme *theme }
+
+func (t themeItem) Title() string { return t.theme.name + "  ·  " + t.theme.desc }
+func (t themeItem) Description() string {
+	return "accent " + string(t.theme.accent) + " · title " + string(t.theme.titleFg) + " on " + string(t.theme.titleBg)
+}
+func (t themeItem) FilterValue() string { return t.theme.name }
+
+// applyThemeToList 把主题套到一个列表上：重建默认 delegate 只换颜色（保留 padding/边框形状）+ 标题条/过滤样式。
+// host 列表和设置面板共用，设置面板里预览时两个都调。
+func applyThemeToList(l *list.Model, t *theme) {
+	d := list.NewDefaultDelegate()
 	d.Styles.SelectedTitle = d.Styles.SelectedTitle.BorderForeground(t.accent).Foreground(t.accent)
 	d.Styles.SelectedDesc = d.Styles.SelectedDesc.BorderForeground(t.accent).Foreground(t.accent)
 	d.Styles.FilterMatch = d.Styles.FilterMatch.Foreground(t.accent)
+	l.SetDelegate(d)
+	l.Styles.Title = lipgloss.NewStyle().
+		Bold(true).
+		Foreground(t.titleFg).
+		Background(t.titleBg).
+		Padding(0, 1)
+	l.Styles.FilterPrompt = lipgloss.NewStyle().Foreground(t.accent)
+	l.Styles.FilterCursor = lipgloss.NewStyle().Foreground(t.accent)
 }
 
 // runThemes 打印 "name\tdesc" 一行一个配色方案；stdout 是终端时 desc 前带色块预览
@@ -418,13 +514,18 @@ func runThemes() {
 	if info, err := os.Stdout.Stat(); err == nil {
 		tty = info.Mode()&os.ModeCharDevice != 0
 	}
+	saved := loadConfig()["theme"]
 	w := bufio.NewWriter(os.Stdout)
 	defer w.Flush()
 	for _, t := range themeList {
 		if tty {
+			desc := t.desc
+			if t.name == saved {
+				desc += "（已保存）"
+			}
 			swatch := lipgloss.NewStyle().Background(t.titleBg).Foreground(t.titleFg).Render(" " + t.name + " ")
 			dot := lipgloss.NewStyle().Foreground(t.accent).Render("●")
-			fmt.Fprintf(w, "%s\t%s %s %s\n", t.name, swatch, dot, t.desc)
+			fmt.Fprintf(w, "%s\t%s %s %s\n", t.name, swatch, dot, desc)
 		} else {
 			fmt.Fprintf(w, "%s\t%s\n", t.name, t.desc)
 		}
@@ -439,6 +540,58 @@ func findExactName(hosts []hostEntry, name string) *hostEntry {
 		}
 	}
 	return nil
+}
+
+// ---------------- config file ----------------
+
+// configFilePath 配置文件：$XDG_CONFIG_HOME/jump/config 或 ~/.config/jump/config
+func configFilePath() string {
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return filepath.Join(xdg, "jump", "config")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "jump", "config")
+}
+
+// loadConfig 读 key=value 每行一个的配置文件；不存在/坏行静默跳过
+func loadConfig() map[string]string {
+	out := map[string]string{}
+	data, err := os.ReadFile(configFilePath())
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		out[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	return out
+}
+
+// saveConfigTheme 把 theme 写回配置文件，保留其他已有 key；失败静默（不阻断 TUI）
+func saveConfigTheme(name string) {
+	cfg := loadConfig()
+	cfg["theme"] = name
+	keys := make([]string, 0, len(cfg))
+	for k := range cfg {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		fmt.Fprintf(&b, "%s=%s\n", k, cfg[k])
+	}
+	p := configFilePath()
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return
+	}
+	writeAtomic(p, b.String())
 }
 
 // ---------------- MRU history ----------------

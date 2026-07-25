@@ -70,6 +70,7 @@ Host metrics
 | enter | 选中 → ssh |
 | q / esc / ctrl+c | 取消退出 |
 | d | 把当前 host 从 MRU 历史里抹掉（不删 host，下次启动它会回落到原序） |
+| t | 打开设置面板（配色方案选择器）：↑↓ 移动**实时预览**，enter 保存到配置文件，esc/q 取消并回滚 |
 | `/` | 进过滤态 |
 
 ## MRU 历史
@@ -95,10 +96,12 @@ jump --completion       # 打印 zsh 补全脚本
 
 ## 配色方案
 
-- 选择方式：`--theme <name>` 旗标 或 `JUMP_THEME` 环境变量（旗标优先），都不给用 `default`
+- **设置入口：TUI 里按 `t`** 打开配色选择器，↑↓ 实时预览，enter 持久化，esc 回滚
+- 持久化到配置文件 `$XDG_CONFIG_HOME/jump/config`（默认 `~/.config/jump/config`），`key=value` 每行一个，目前只有 `theme=<name>`
+- 优先级：`--theme` 旗标 > `JUMP_THEME` 环境变量 > 配置文件 > `default`
 - 方案定义在 main.go 的 `themeList`：标题条前景/背景 + accent（选中项 / 过滤提示符 / fuzzy 匹配高亮），加方案 = 加一行
-- `applyTheme` 只换颜色，不动默认 delegate 的 padding / 边框形状
-- 解析时机在直连路径**之后**：`jump s1` 直连不受 `JUMP_THEME` 笔误影响；进 TUI 前才校验，未知名字报错并列出全部可选，exit 1
+- `applyThemeToList` 只换颜色，不动默认 delegate 的 padding / 边框形状；host 列表和设置面板共用，预览时两个都刷
+- 解析时机在直连路径**之后**：`jump s1` 直连不受主题配置影响。旗标/环境变量写错 → 报错列出全部可选，exit 1；配置文件里的脏值 → 静默回退 `default`（不挡 TUI）
 
 ## zsh 补全安装
 
