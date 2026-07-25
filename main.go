@@ -135,7 +135,7 @@ func main() {
 		configPath = p
 	}
 
-	// 模式开关：--list / --completion 走完即退，不进 TUI
+	// 模式开关：--list / --completion / --themes 走完即退，不进 TUI
 	for _, a := range os.Args[1:] {
 		switch a {
 		case "--list":
@@ -144,6 +144,9 @@ func main() {
 		case "--completion":
 			// 默认输出 zsh 脚本（目前只支持 zsh）
 			runCompletion()
+			return
+		case "--themes":
+			runThemes()
 			return
 		}
 	}
@@ -158,9 +161,30 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 先抽掉 jump 自己的 --theme 旗标（优先于 JUMP_THEME 环境变量），其余参数原样透传给 ssh
+	themeName := os.Getenv("JUMP_THEME")
+	var rest []string
+	for i := 1; i < len(os.Args); i++ {
+		a := os.Args[i]
+		if a == "--theme" {
+			if i+1 >= len(os.Args) {
+				fmt.Fprintln(os.Stderr, "--theme requires a value (see --themes)")
+				os.Exit(2)
+			}
+			themeName = os.Args[i+1]
+			i++
+			continue
+		}
+		if v, ok := strings.CutPrefix(a, "--theme="); ok {
+			themeName = v
+			continue
+		}
+		rest = append(rest, a)
+	}
+
 	// CLI 透传 & 预填过滤：第一个非 flag 的位置参数作为初始过滤词，剩余原样给 ssh
 	var initialFilter string
-	sshExtraArgs := os.Args[1:]
+	sshExtraArgs := rest
 	if len(sshExtraArgs) > 0 && !strings.HasPrefix(sshExtraArgs[0], "-") {
 		initialFilter = sshExtraArgs[0]
 		sshExtraArgs = sshExtraArgs[1:]
@@ -192,20 +216,39 @@ func main() {
 		hosts = narrowed
 	}
 
+	// 配色：放在直连路径之后才解析，j s1 直连不受 JUMP_THEME 笔误影响；
+	// 进 TUI 前校验，未知名字报错列出全部可选
+	if themeName == "" {
+		themeName = "default"
+	}
+	th := findTheme(themeName)
+	if th == nil {
+		fmt.Fprintf(os.Stderr, "unknown theme %q, available:\n", themeName)
+		for _, t := range themeList {
+			fmt.Fprintf(os.Stderr, "  %s\t%s\n", t.name, t.desc)
+		}
+		os.Exit(1)
+	}
+
 	items := make([]list.Item, 0, len(hosts))
 	for _, h := range hosts {
 		items = append(items, h)
 	}
 
-	l := list.New(items, list.NewDefaultDelegate(), 80, 20)
+	delegate := list.NewDefaultDelegate()
+	applyTheme(&delegate, th)
+
+	l := list.New(items, delegate, 80, 20)
 	l.Title = fmt.Sprintf("ssh hosts  (%d entries from %s)", len(hosts), prettyPath(configPath))
 	l.SetShowStatusBar(true)
 	l.SetFilteringEnabled(true)
 	l.Styles.Title = lipgloss.NewStyle().
 		Bold(true).
-		Foreground(lipgloss.Color("#FAFAFA")).
-		Background(lipgloss.Color("#7D56F4")).
+		Foreground(th.titleFg).
+		Background(th.titleBg).
 		Padding(0, 1)
+	l.Styles.FilterPrompt = lipgloss.NewStyle().Foreground(th.accent)
+	l.Styles.FilterCursor = lipgloss.NewStyle().Foreground(th.accent)
 
 	p := tea.NewProgram(model{list: l}, tea.WithAltScreen())
 	finalM, err := p.Run()
@@ -296,8 +339,27 @@ func runCompletion() {
 	fmt.Print(`#compdef jump j
 
 _jump() {
-    local -a hosts
+    local -a hosts themes opts
     local name desc
+    # --theme 后面补配色方案名
+    if [[ ${words[CURRENT-1]} == "--theme" ]]; then
+        while IFS=$'\t' read -r name desc; do
+            themes+=("${name}:${desc}")
+        done < <(jump --themes 2>/dev/null)
+        _describe -t themes 'color scheme' themes
+        return
+    fi
+    # 输入以 -- 开头时补 jump 自己的选项
+    if [[ $PREFIX == --* ]]; then
+        opts=(
+            '--theme:select color scheme'
+            '--themes:list color schemes'
+            '--list:print hosts for completion'
+            '--completion:print zsh completion script'
+        )
+        _describe -t options 'jump option' opts
+        return
+    fi
     while IFS=$'\t' read -r name desc; do
         if [[ -n "$desc" ]]; then
             hosts+=("${name}:${desc}")
@@ -310,6 +372,63 @@ _jump() {
 
 compdef _jump jump j
 `)
+}
+
+// ---------------- themes ----------------
+
+type theme struct {
+	name    string
+	desc    string
+	titleFg lipgloss.Color // 标题条前景
+	titleBg lipgloss.Color // 标题条背景
+	accent  lipgloss.Color // 选中项 / 过滤提示符 / fuzzy 匹配高亮
+}
+
+// themeList 全部配色方案，default 为缺省。新加方案往这里塞一行即可。
+var themeList = []theme{
+	{name: "default", desc: "经典紫（默认）", titleFg: "#FAFAFA", titleBg: "#7D56F4", accent: "#EE6FF8"},
+	{name: "ocean", desc: "海蓝", titleFg: "#FAFAFA", titleBg: "#0369A1", accent: "#38BDF8"},
+	{name: "forest", desc: "森绿", titleFg: "#FAFAFA", titleBg: "#047857", accent: "#34D399"},
+	{name: "amber", desc: "琥珀", titleFg: "#292524", titleBg: "#F59E0B", accent: "#FBBF24"},
+	{name: "rose", desc: "玫红", titleFg: "#FAFAFA", titleBg: "#BE123C", accent: "#FB7185"},
+	{name: "dracula", desc: "德古拉紫粉", titleFg: "#282A36", titleBg: "#BD93F9", accent: "#FF79C6"},
+	{name: "nord", desc: "北欧冷灰蓝", titleFg: "#ECEFF4", titleBg: "#5E81AC", accent: "#88C0D0"},
+	{name: "mono", desc: "黑白极简", titleFg: "#FAFAFA", titleBg: "#525252", accent: "#D4D4D4"},
+}
+
+func findTheme(name string) *theme {
+	for i := range themeList {
+		if themeList[i].name == name {
+			return &themeList[i]
+		}
+	}
+	return nil
+}
+
+// applyTheme 只换颜色，保留默认 delegate 的 padding / 边框形状
+func applyTheme(d *list.DefaultDelegate, t *theme) {
+	d.Styles.SelectedTitle = d.Styles.SelectedTitle.BorderForeground(t.accent).Foreground(t.accent)
+	d.Styles.SelectedDesc = d.Styles.SelectedDesc.BorderForeground(t.accent).Foreground(t.accent)
+	d.Styles.FilterMatch = d.Styles.FilterMatch.Foreground(t.accent)
+}
+
+// runThemes 打印 "name\tdesc" 一行一个配色方案；stdout 是终端时 desc 前带色块预览
+func runThemes() {
+	tty := false
+	if info, err := os.Stdout.Stat(); err == nil {
+		tty = info.Mode()&os.ModeCharDevice != 0
+	}
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+	for _, t := range themeList {
+		if tty {
+			swatch := lipgloss.NewStyle().Background(t.titleBg).Foreground(t.titleFg).Render(" " + t.name + " ")
+			dot := lipgloss.NewStyle().Foreground(t.accent).Render("●")
+			fmt.Fprintf(w, "%s\t%s %s %s\n", t.name, swatch, dot, t.desc)
+		} else {
+			fmt.Fprintf(w, "%s\t%s\n", t.name, t.desc)
+		}
+	}
 }
 
 func findExactName(hosts []hostEntry, name string) *hostEntry {

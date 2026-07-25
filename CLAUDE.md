@@ -55,7 +55,7 @@ Host metrics
 
 ## 入口流程（main 函数）
 
-1. 模式开关：`--list` / `--completion` 走特殊路径，直接 print 完退出
+1. 模式开关：`--list` / `--completion` / `--themes` 走特殊路径，直接 print 完退出
 2. 读 `$SSH_CONFIG` 或 `~/.ssh/config`
 3. `parseSSHConfig` 递归处理 `Include` 指令、跳过通配符 host、按 name 首次出现去重；`Match` 块整体忽略且会 flush 上一个 Host bucket，防止字段污染；除 HostName/User 外还解析 Port / ProxyJump
 4. 按 `~/.local/state/jump/history` 里的最近选中时间排序（MRU），没用过的按 ssh config 原序落在后面
@@ -87,9 +87,18 @@ jump prod               # 子串过滤 'prod' 的子列表 TUI；若 'prod' 恰�
 jump s1                 # host 名命中 → 直接 ssh s1
 jump s1 -p 2222         # 直连 + ssh 透传 -p 2222
 jump -p 2222            # 全列表 TUI，选中后透传 -p 2222
+jump --theme ocean      # 指定配色开 TUI（旗标会被剥掉，不透传给 ssh）
 jump --list             # 打印 'name\tdesc' 一行一个，给补全脚本用
+jump --themes           # 打印全部配色方案（终端里带色块预览）
 jump --completion       # 打印 zsh 补全脚本
 ```
+
+## 配色方案
+
+- 选择方式：`--theme <name>` 旗标 或 `JUMP_THEME` 环境变量（旗标优先），都不给用 `default`
+- 方案定义在 main.go 的 `themeList`：标题条前景/背景 + accent（选中项 / 过滤提示符 / fuzzy 匹配高亮），加方案 = 加一行
+- `applyTheme` 只换颜色，不动默认 delegate 的 padding / 边框形状
+- 解析时机在直连路径**之后**：`jump s1` 直连不受 `JUMP_THEME` 笔误影响；进 TUI 前才校验，未知名字报错并列出全部可选，exit 1
 
 ## zsh 补全安装
 
@@ -99,7 +108,7 @@ jump --completion       # 打印 zsh 补全脚本
 source <(jump --completion)
 ```
 
-之后 `jump <TAB>` / `j <TAB>` 会列出所有 host（带 tag/备注），顺序与 TUI 一致（MRU）。
+之后 `jump <TAB>` / `j <TAB>` 会列出所有 host（带 tag/备注），顺序与 TUI 一致（MRU）。`--theme` 后面补全配色方案名，`--` 开头补全 jump 自己的选项。
 
 ## 依赖
 
