@@ -1,0 +1,39 @@
+# 演示用假配置（VHS 录屏专用）
+# 安全设计：host 名一律 demo- 前缀，真实 config 里不存在——
+# 万一录屏误触 Enter 触发 exec ssh，会瞬间 resolve 失败退出，绝不会连到真机器
+
+# cwd=/data/app tag=prod svc=nginx,redis,pg  阿里云北京 客户A 主站
+Host demo-web1
+    HostName 10.20.1.11
+    User root
+
+# tag=prod svc=java,api  阿里云北京 客户A 订单服务
+Host demo-web2
+    HostName 10.20.1.12
+    User deploy
+
+# tag=staging svc=docker  测试环境 随便造
+Host demo-stg
+    HostName 10.20.2.31
+    User ubuntu
+
+# tag=ops svc=prometheus,grafana  监控大盘
+Host demo-mon
+    HostName 10.20.3.10
+    User root
+    Port 2222
+
+# tag=ops cmd=df -h | head -8
+Host demo-disk
+    HostName 10.20.3.11
+
+# tag=db svc=mysql-8.0  主库 只读从库走 demo-db2
+Host demo-db1
+    HostName 10.20.4.21
+
+# 新加坡 CDN 边缘节点 tag=edge svc=nginx,cache
+Host demo-edge
+    HostName 10.30.1.5
+
+Host demo-bare  # 无备注裸机，行为等同裸 ssh
+    HostName 10.20.9.99
